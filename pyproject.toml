@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openjutsu-capsules"
+version = "0.1.0"
+description = "Portable, inspectable and continuable AI video/image Takes for ComfyUI: validated H3 family publication, SDK asset transport and typed capsule contracts."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = []
+
+classifiers = [
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+]
+
+[project.urls]
+Repository = "https://github.com/lvsas/ComfyUI-OpenJutsu-Capsules"
+"Bug Tracker" = "https://github.com/lvsas/ComfyUI-OpenJutsu-Capsules/issues"
+
+[tool.comfy]
+PublisherId = "lvsas"
+DisplayName = "OpenJutsu Capsules"
+requires-comfyui = ">=0.40.0"

@@ -1,0 +1,328 @@
+"""CPU adapter tests. Structural sidecars are unit fixtures, NOT native H3 proof."""
+import hashlib
+import importlib
+import json
+import math
+import os
+from pathlib import Path
+import struct
+import subprocess
+import sys
+import tempfile
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _pack import load  # noqa: E402
+
+
+def tensor_file(tensors, metadata):
+    header, payload = {'__metadata__': metadata}, bytearray()
+    sizes = {'F16': 2, 'F32': 4, 'U8': 1}
+    for name, (dtype, shape, data) in tensors.items():
+        data = data if data is not None else bytes(math.prod(shape) * sizes[dtype])
+        start = len(payload)
+        payload.extend(data)
+        header[name] = {'dtype': dtype, 'shape': shape, 'data_offsets': [start, len(payload)]}
+    raw = json.dumps(header).encode()
+    return struct.pack('<Q', len(raw)) + raw + payload
+
+
+class ContinuityTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.nodes = load('nodes')
+        cls.io = load('family')
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.input = self.root / 'input'
+        self.output = self.root / 'output'
+        self.input.mkdir()
+        self.output.mkdir()
+        self.folders = patch.dict(sys.modules, {'folder_paths': SimpleNamespace(
+            get_input_directory=lambda: str(self.input), get_output_directory=lambda: str(self.output))})
+        self.folders.start()
+        self.addCleanup(self.folders.stop)
+        video = self.input / 'uploads/a/dedup.mp4'
+        video.parent.mkdir(parents=True)
+        subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'color=c=blue:s=32x32:r=24',
+                        '-frames:v', '5', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', str(video)], check=True)
+        identity = hashlib.sha256(video.read_bytes()).hexdigest()
+        meta = {'format': 'mctx_v1', 'self_id': identity, 'width': '32', 'height': '32',
+                'fps': '24', 'raw_frames': '5', 'delivered_frames': '5'}
+        structure = json.dumps({'__list__': [{'__list__': [
+            {'__tensor__': 'embedding'}, {'__dict__': {}}]}]}).encode()
+        mctx = self.input / 'uploads/b/other.mctx.safetensors'
+        cond = self.input / 'entirely/different/renamed.cond.safetensors'
+        mctx.parent.mkdir(parents=True)
+        cond.parent.mkdir(parents=True)
+        mctx.write_bytes(tensor_file({'video': ('F16', [1, 24, 2, 2, 2], None),
+                                      'audio': ('F16', [1, 32, 2, 5], None)}, meta))
+        cond.write_bytes(tensor_file({'embedding': ('F32', [1, 2, 3], None),
+                                      'structure': ('U8', [len(structure)], structure)},
+                                     {'format': 'obvpm_cond_v1', 'self_id': identity}))
+        self.paths = [video, mctx, cond]
+        self.args = dict(zip(('video', 'mctx', 'conditioning'),
+                             (p.relative_to(self.input).as_posix() for p in self.paths)))
+
+    def restage(self, **overrides):
+        return self.nodes.OpenGenjutsuH3RestageFamily().execute(**(self.args | {'family_name': 'proof'} | overrides))
+
+    def test_restage_fixed_names_hashes_and_output_relative_handle(self):
+        result = self.restage()
+        handle, manifest = result['result']
+        self.assertEqual(handle, 'opengenjutsu_continuity/proof/take.mp4')
+        folder = self.output / 'opengenjutsu_continuity/proof'
+        names = ['take.mp4', 'take.mctx.safetensors', 'take.cond.safetensors']
+        self.assertEqual(sorted(p.name for p in folder.iterdir()), sorted(names))
+        for source, name in zip(self.paths, names):
+            self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(),
+                             hashlib.sha256((folder / name).read_bytes()).hexdigest())
+        self.assertEqual(result['ui']['files'], [
+            {'filename': name, 'subfolder': 'opengenjutsu_continuity/proof', 'type': 'output'} for name in names])
+        self.assertNotIn(str(self.root), manifest)
+        self.assertFalse(json.loads(manifest)['verification']['model_runtime_compatibility'])
+
+    def test_clip_publisher_consumes_actual_saved_path_without_scanning(self):
+        first = self.restage()
+        clip = first['result'][0]
+        publisher = self.nodes.OpenGenjutsuH3PublishClip()
+        self.assertEqual(publisher.INPUT_TYPES()['required']['clip'][0], 'STRING')
+        self.assertTrue(math.isnan(publisher.IS_CHANGED()))
+        for supplied in (clip, str(self.output / clip)):
+            with self.subTest(supplied=supplied), patch.object(Path, 'glob', side_effect=AssertionError('scan')), \
+                    patch.object(Path, 'iterdir', side_effect=AssertionError('scan')):
+                self.assertEqual(publisher.execute(supplied), first)
+
+    def test_clip_publisher_refuses_missing_state_unsafe_path_and_wrong_identity(self):
+        clip = self.restage()['result'][0]
+        publisher = self.nodes.OpenGenjutsuH3PublishClip()
+        for value in ('../escape.mp4', str(self.paths[0]), 'x\\\\y.mp4', 'x.webm', '', None):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                publisher.execute(value)
+        cond = self.output / clip.replace('.mp4', '.cond.safetensors')
+        original = cond.read_bytes()
+        cond.unlink()
+        with self.assertRaises(ValueError):
+            publisher.execute(clip)
+        cond.write_bytes(original.replace(hashlib.sha256(self.paths[0].read_bytes()).hexdigest().encode(),
+                                          b'0' * 64))
+        with self.assertRaises(ValueError):
+            publisher.execute(clip)
+
+    def test_clip_publisher_refuses_symlink_components(self):
+        clip = self.restage()['result'][0]
+        publisher = self.nodes.OpenGenjutsuH3PublishClip()
+        (self.output / 'linked').symlink_to((self.output / clip).parent, target_is_directory=True)
+        with self.assertRaises(ValueError):
+            publisher.execute('linked/take.mp4')
+
+    def test_publisher_literal_descriptors_explicit_paths(self):
+        result = self.restage()
+        folder = self.output / 'opengenjutsu_continuity/proof'
+        pub = self.nodes.OpenGenjutsuH3PublishFamily().execute(
+            video=str(folder / 'take.mp4'), mctx='opengenjutsu_continuity/proof/take.mctx.safetensors',
+            conditioning='opengenjutsu_continuity/proof/take.cond.safetensors')
+        self.assertEqual(pub, result)
+
+    def test_no_clobber_existing_empty_directory(self):
+        destination = self.output / 'opengenjutsu_continuity/proof'
+        destination.mkdir(parents=True)
+        with self.assertRaisesRegex(ValueError, 'collision'):
+            self.restage()
+        self.assertEqual(list(destination.iterdir()), [])
+        self.assertEqual(list(destination.parent.iterdir()), [destination])
+
+    def test_repeat_does_not_overwrite(self):
+        first = self.restage()
+        with self.assertRaisesRegex(ValueError, 'collision'):
+            self.restage()
+        self.assertTrue((self.output / first['result'][0]).is_file())
+
+    def test_names_traversal_absolute_and_symlink_escape(self):
+        for name in ('../escape', '/absolute', '.', '..', 'x/y', 'x\\y', '', '.hidden', 'x\n'):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                self.restage(family_name=name)
+        for value in ('../missing.mp4', str(self.paths[0]), 'uploads/./a/dedup.mp4', 'x\\y.mp4'):
+            with self.subTest(path=value), self.assertRaises(ValueError):
+                self.restage(video=value)
+        (self.input / 'escape.mp4').symlink_to(self.paths[0])
+        with self.assertRaises(ValueError):
+            self.restage(video='escape.mp4')
+        (self.input / 'link').symlink_to(self.paths[0].parent, target_is_directory=True)
+        with self.assertRaises(ValueError):
+            self.restage(video='link/dedup.mp4')
+
+    def test_pack_directory_symlink_rejected(self):
+        outside = self.root / 'outside'
+        outside.mkdir()
+        (self.output / 'opengenjutsu_continuity').symlink_to(outside, target_is_directory=True)
+        with self.assertRaises(ValueError):
+            self.restage()
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_nonregular_missing_wrong_suffix_and_identity(self):
+        for args in ({'mctx': 'missing.mctx.safetensors'}, {'mctx': self.args['conditioning']},
+                     {'video': 'uploads/a'}, {'conditioning': self.args['conditioning'] + '/bad'}):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                self.restage(**args)
+        cond = self.paths[2]
+        cond.write_bytes(cond.read_bytes().replace(b'obvpm_cond_v1', b'obvpm_cond_v2'))
+        with self.assertRaisesRegex(ValueError, 'unsupported_format'):
+            self.restage()
+        cond.write_bytes(cond.read_bytes().replace(b'obvpm_cond_v2', b'obvpm_cond_v1'))
+        cond.write_bytes(cond.read_bytes().replace(hashlib.sha256(self.paths[0].read_bytes()).hexdigest().encode(), b'0' * 64))
+        with self.assertRaisesRegex(ValueError, 'identity_mismatch'):
+            self.restage()
+
+    def test_partial_copy_failure_cleanup_and_path_free_error(self):
+        with patch.object(self.io, '_copy_file', side_effect=OSError(str(self.root / 'secret'))):
+            with self.assertRaises(ValueError) as error:
+                self.restage()
+        self.assertNotIn(str(self.root), str(error.exception))
+        self.assertEqual(list((self.output / 'opengenjutsu_continuity').iterdir()), [])
+
+    def test_source_mutation_during_copy_is_rejected(self):
+        real = self.io._copy_file
+        changed = False
+        def mutate(*args, **kwargs):
+            nonlocal changed
+            result = real(*args, **kwargs)
+            if not changed:
+                changed = True
+                with self.paths[0].open('ab') as stream:
+                    stream.write(b'changed')
+            return result
+        with patch.object(self.io, '_copy_file', side_effect=mutate):
+            with self.assertRaisesRegex(ValueError, 'artifact_changed'):
+                self.restage()
+        self.assertEqual(list((self.output / 'opengenjutsu_continuity').iterdir()), [])
+
+    def test_unsupported_atomic_publish_fails_closed(self):
+        with patch.object(self.io, '_rename_noreplace', side_effect=self.io.ContinuityError('unsupported_atomic_publish')):
+            with self.assertRaisesRegex(ValueError, 'unsupported_atomic_publish'):
+                self.restage()
+        self.assertEqual(list((self.output / 'opengenjutsu_continuity').iterdir()), [])
+
+    def test_publisher_different_stems_no_invented_loader_handle(self):
+        for path in self.paths:
+            destination = self.output / path.relative_to(self.input)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(path.read_bytes())
+        result = self.nodes.OpenGenjutsuH3PublishFamily().execute(**self.args)
+        self.assertEqual(result['result'][0], '')
+        self.assertEqual(len(result['ui']['files']), 3)
+        for descriptor, path in zip(result['ui']['files'], self.paths):
+            self.assertEqual(descriptor, {'filename': path.name,
+                'subfolder': path.relative_to(self.input).parent.as_posix(), 'type': 'output'})
+
+    def test_existing_final_file_and_symlink_are_never_overwritten(self):
+        parent = self.output / 'opengenjutsu_continuity'
+        parent.mkdir()
+        final = parent / 'proof'
+        final.write_bytes(b'keep')
+        with self.assertRaisesRegex(ValueError, 'collision'):
+            self.restage()
+        self.assertEqual(final.read_bytes(), b'keep')
+        final.unlink()
+        outside = self.root / 'outside'
+        outside.mkdir()
+        final.symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, 'collision'):
+            self.restage()
+        self.assertTrue(final.is_symlink())
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_fifo_is_refused_without_blocking(self):
+        os.mkfifo(self.input / 'pipe.mp4')
+        with self.assertRaisesRegex(ValueError, 'not_regular_file'):
+            self.restage(video='pipe.mp4')
+
+    def test_publisher_absolute_escape_symlink_and_pathfree_failure(self):
+        for value in (str(self.paths[0]), '../input/uploads/a/dedup.mp4'):
+            with self.subTest(value=value), self.assertRaises(ValueError) as error:
+                self.nodes.OpenGenjutsuH3PublishFamily().execute(video=value,
+                    mctx=self.args['mctx'], conditioning=self.args['conditioning'])
+            self.assertNotIn(str(self.root), str(error.exception))
+        (self.output / 'linked.mp4').symlink_to(self.paths[0])
+        with self.assertRaises(ValueError):
+            self.nodes.OpenGenjutsuH3PublishFamily().execute(video='linked.mp4',
+                mctx=self.args['mctx'], conditioning=self.args['conditioning'])
+
+    def test_copy_corruption_fails_second_validation_and_cleans_stage(self):
+        real = self.io._copy_file
+        def corrupt(fd, directory, name):
+            real(fd, directory, name)
+            if name == 'take.cond.safetensors':
+                target = os.open(name, os.O_WRONLY | os.O_APPEND, dir_fd=directory)
+                try:
+                    os.write(target, b'corruption')
+                finally:
+                    os.close(target)
+        with patch.object(self.io, '_copy_file', side_effect=corrupt), self.assertRaises(ValueError):
+            self.restage()
+        self.assertEqual(list((self.output / 'opengenjutsu_continuity').iterdir()), [])
+
+    def test_atomic_collision_created_during_publish(self):
+        real = self.io._rename_noreplace
+        def collide(parent, source, destination):
+            os.mkdir(destination, dir_fd=parent)
+            real(parent, source, destination)
+        with patch.object(self.io, '_rename_noreplace', side_effect=collide):
+            with self.assertRaisesRegex(ValueError, 'collision'):
+                self.restage()
+        final = self.output / 'opengenjutsu_continuity/proof'
+        self.assertEqual(list(final.iterdir()), [])
+        self.assertEqual(list(final.parent.iterdir()), [final])
+
+    def test_fake_mp4_and_geometry_mismatch_are_refused(self):
+        original = self.paths[1].read_bytes()
+        self.paths[1].write_bytes(original.replace(b'"delivered_frames": "5"', b'"delivered_frames": "4"'))
+        with self.assertRaisesRegex(ValueError, 'media_mismatch'):
+            self.restage()
+        self.paths[1].write_bytes(original)
+        old_hash = hashlib.sha256(self.paths[0].read_bytes()).hexdigest().encode()
+        self.paths[0].write_bytes(b'not an MP4')
+        new_hash = hashlib.sha256(self.paths[0].read_bytes()).hexdigest().encode()
+        for path in self.paths[1:]:
+            path.write_bytes(path.read_bytes().replace(old_hash, new_hash))
+        with self.assertRaisesRegex(ValueError, 'invalid_media'):
+            self.restage()
+
+    def test_both_sidecars_required_even_if_video_has_neighbours(self):
+        self.paths[2].unlink()
+        with self.assertRaises(ValueError):
+            self.restage()
+        self.assertFalse((self.output / 'opengenjutsu_continuity/proof').exists())
+
+    def test_schema_and_uncached_filesystem_nodes(self):
+        for cls in (self.nodes.OpenGenjutsuH3PublishFamily, self.nodes.OpenGenjutsuH3RestageFamily):
+            self.assertTrue(cls.OUTPUT_NODE)
+            self.assertEqual(cls.RETURN_TYPES, ('STRING', 'STRING'))
+            self.assertTrue(math.isnan(cls.IS_CHANGED()))
+            for name in ('video', 'mctx', 'conditioning'):
+                self.assertEqual(cls.INPUT_TYPES()['required'][name][0], 'STRING')
+
+
+
+class ContractProvenanceTests(unittest.TestCase):
+    """The bundled contracts must match the hashes recorded with them."""
+
+    def test_bundled_contracts_match_recorded_provenance(self):
+        root = Path(__file__).resolve().parents[1]
+        provenance = json.loads((root / "_contract" / "provenance.json").read_text())
+        self.assertTrue(provenance, "provenance.json must not be empty")
+        for name, recorded in provenance.items():
+            bundle = root / "_contract" / name
+            self.assertTrue(bundle.is_file(), f"{name} is recorded but missing")
+            self.assertEqual(hashlib.sha256(bundle.read_bytes()).hexdigest(),
+                             recorded["bundle_sha256"], f"{name} drifted from its provenance")
+
+
+if __name__ == "__main__":
+    unittest.main()

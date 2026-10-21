@@ -1,0 +1,6 @@
+# Files excluded from the Comfy Registry package archive (the repository keeps them).
+tests/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.gitignore
