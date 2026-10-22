@@ -14,7 +14,9 @@ import stat
 import sys
 import uuid
 
-from ._contract.timeline_artifacts import ArtifactValidationError, validate_h3_artifact_set
+from ._contract.timeline_artifacts import (
+    ArtifactValidationError, has_h3_role_suffix, validate_h3_artifact_set,
+)
 
 ROLES = ('video', 'mctx', 'conditioning')
 NAMES = ('take.mp4', 'take.mctx.safetensors', 'take.cond.safetensors')
@@ -110,14 +112,6 @@ def _blocks(fd):
         raise _error('artifact_changed')
 
 
-_DEDUP = re.compile(r' \(\d+\)(?=\.[^./]+$|$)')
-
-
-def _role_name(path):
-    """Drop ComfyUI's " (1)" dedup marker so the role suffix still matches."""
-    return _DEDUP.sub('', path)
-
-
 def _digest(fd):
     digest = hashlib.sha256()
     for block in _blocks(fd):
@@ -128,10 +122,9 @@ def _digest(fd):
 @contextmanager
 def _sources(root, values, absolute_allowed):
     relative = [_relative(value, root, absolute_allowed) for value in values]
-    # ComfyUI inserts its dedup marker before the final extension, so
-    # "take.mctx (1).safetensors" still carries the .mctx role. Compare the role
-    # suffix, never the exact filename the server happened to choose.
-    if any(not _role_name(path).endswith(suffix) for path, suffix in zip(relative, SUFFIXES)):
+    # Use the very same policy as the validator below; two independent suffix
+    # rules previously disagreed on "take.mctx (1).safetensors".
+    if any(not has_h3_role_suffix(path, role) for path, role in zip(relative, ROLES)):
         raise _error('unsupported_suffix')
     root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     files = []
