@@ -20,7 +20,10 @@ ROLES = ('video', 'mctx', 'conditioning')
 NAMES = ('take.mp4', 'take.mctx.safetensors', 'take.cond.safetensors')
 SUFFIXES = ('.mp4', '.mctx.safetensors', '.cond.safetensors')
 PACK_DIRECTORY = 'opengenjutsu_continuity'
-_COMPONENT = re.compile(r'[A-Za-z0-9][A-Za-z0-9_. -]{0,199}\Z')
+# ComfyUI deduplicates uploads as "take (1).mp4", so parentheses and spaces are
+# legitimate. Separators, control characters, a leading dot and a trailing dot or
+# space remain refused; every component is still opened with O_NOFOLLOW.
+_COMPONENT = re.compile(r'[A-Za-z0-9][A-Za-z0-9_. ()\-]{0,199}\Z')
 _FAMILY = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,79}\Z')
 BLOCK_BYTES = 1024 * 1024
 

@@ -156,6 +156,14 @@ class ContinuityTests(unittest.TestCase):
             self.restage()
         self.assertTrue((self.output / first['result'][0]).is_file())
 
+    def test_comfyui_deduplicated_upload_names_are_accepted(self):
+        # ComfyUI renames a second upload to "take (1).mp4"; the node must read it.
+        names = ['take (1).mp4', 'take (1).mctx.safetensors', 'take (1).cond.safetensors']
+        for source, name in zip(self.paths, names):
+            (self.input / name).write_bytes(source.read_bytes())
+        result = self.nodes.OpenGenjutsuH3RestageFamily().execute(*names, 'proof-dedup')
+        self.assertEqual(result['result'][0], 'opengenjutsu_continuity/proof-dedup/take.mp4')
+
     def test_names_traversal_absolute_and_symlink_escape(self):
         for name in ('../escape', '/absolute', '.', '..', 'x/y', 'x\\y', '', '.hidden', 'x\n'):
             with self.subTest(name=name), self.assertRaises(ValueError):
