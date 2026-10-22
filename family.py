@@ -110,6 +110,14 @@ def _blocks(fd):
         raise _error('artifact_changed')
 
 
+_DEDUP = re.compile(r' (?:\\(\\d+\\))(?=\\.[^./]+$|$)')
+
+
+def _role_name(path):
+    """Drop ComfyUI's " (1)" dedup marker so the role suffix still matches."""
+    return _DEDUP.sub('', path)
+
+
 def _digest(fd):
     digest = hashlib.sha256()
     for block in _blocks(fd):
@@ -120,7 +128,10 @@ def _digest(fd):
 @contextmanager
 def _sources(root, values, absolute_allowed):
     relative = [_relative(value, root, absolute_allowed) for value in values]
-    if any(not path.endswith(suffix) for path, suffix in zip(relative, SUFFIXES)):
+    # ComfyUI inserts its dedup marker before the final extension, so
+    # "take.mctx (1).safetensors" still carries the .mctx role. Compare the role
+    # suffix, never the exact filename the server happened to choose.
+    if any(not _role_name(path).endswith(suffix) for path, suffix in zip(relative, SUFFIXES)):
         raise _error('unsupported_suffix')
     root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     files = []
