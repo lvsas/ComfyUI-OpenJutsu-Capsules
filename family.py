@@ -110,7 +110,7 @@ def _blocks(fd):
         raise _error('artifact_changed')
 
 
-_DEDUP = re.compile(r' (?:\\(\\d+\\))(?=\\.[^./]+$|$)')
+_DEDUP = re.compile(r' \(\d+\)(?=\.[^./]+$|$)')
 
 
 def _role_name(path):
